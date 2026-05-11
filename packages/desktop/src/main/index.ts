@@ -11,7 +11,7 @@ import { app, BrowserWindow } from "electron"
 
 import contextMenu from "electron-context-menu"
 
-import type { InitStep, ServerReadyData, SqliteMigrationProgress, WslConfig } from "../preload/types"
+import type { InitStep, ServerReadyData, SqliteMigrationProgress } from "../preload/types"
 import { checkAppExists, resolveAppPath, wslPath } from "./apps"
 import { CHANNEL, UPDATER_ENABLED } from "./constants"
 import { registerIpcHandlers, sendDeepLinks, sendMenuCommand, sendSqliteMigrationProgress } from "./ipc"
@@ -20,13 +20,13 @@ import { parseMarkdown } from "./markdown"
 import { createMenu } from "./menu"
 import {
   getDefaultServerUrl,
-  getWslConfig,
   preferAppEnv,
   setDefaultServerUrl,
-  setWslConfig,
   spawnLocalServer,
+  spawnWslSidecar,
   type SidecarListener,
 } from "./server"
+import { createWslServersController } from "./wsl-servers"
 import {
   createLoadingWindow,
   createMainWindow,
@@ -53,6 +53,7 @@ const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
 let logger: ReturnType<typeof initLogging>
 let mainWindow: BrowserWindow | null = null
 let server: SidecarListener | null = null
+let wslServers: ReturnType<typeof createWslServersController> | null = null
 
 const initEmitter = new EventEmitter()
 let initStep: InitStep = { phase: "server_waiting" }
@@ -74,6 +75,12 @@ function emitDeepLinks(urls: string[]) {
   if (mainWindow) sendDeepLinks(mainWindow, urls)
 }
 
+function focusMainWindow() {
+  if (!mainWindow) return
+  mainWindow.show()
+  mainWindow.focus()
+}
+
 function setInitStep(step: InitStep) {
   initStep = step
   logger.log("init step", { step })
@@ -85,6 +92,13 @@ async function killSidecar() {
   const current = server
   server = null
   await current.stop()
+}
+
+function relaunchApp() {
+  void killSidecar()
+  wslServers?.stopAll()
+  app.relaunch()
+  app.exit(0)
 }
 
 function ensureLoopbackNoProxy() {
@@ -107,10 +121,15 @@ function ensureLoopbackNoProxy() {
   upsert("no_proxy")
 }
 
+function sqliteFileExists() {
+  const xdg = process.env.XDG_DATA_HOME
+  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "share")
+  return existsSync(join(base, "opencode", "opencode.db"))
+}
+
 const main = Effect.gen(function* () {
   contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
 
-  // on macOS apps run in `/` which can cause issues with ripgrep
   try {
     process.chdir(homedir())
   } catch {}
@@ -142,6 +161,21 @@ const main = Effect.gen(function* () {
   if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
   logger = initLogging()
 
+  const wslController = createWslServersController(
+    app.getVersion(),
+    async (distro) => {
+      logger.log("spawning wsl sidecar", { distro })
+      return spawnWslSidecar(distro, {
+        onLine: (line) => logger.log("wsl sidecar", { distro, stream: line.stream, text: line.text }),
+      })
+    },
+    {
+      log: (message, meta) => logger.log(message, meta),
+      error: (message, meta) => logger.error(message, meta),
+    },
+  )
+  wslServers = wslController
+
   try {
     setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
   } catch (error) {
@@ -172,10 +206,7 @@ const main = Effect.gen(function* () {
       logger.log("deep link received via second-instance", { urls })
       emitDeepLinks(urls)
     }
-    if (mainWindow) {
-      mainWindow.show()
-      mainWindow.focus()
-    }
+    focusMainWindow()
   })
 
   app.on("open-url", (event: Event, url: string) => {
@@ -186,15 +217,20 @@ const main = Effect.gen(function* () {
 
   app.on("before-quit", () => {
     void killSidecar()
+    wslController.stopAll()
   })
 
   app.on("will-quit", () => {
     void killSidecar()
+    wslController.stopAll()
   })
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
-      void killSidecar().finally(() => app.exit(0))
+      void killSidecar().finally(() => {
+        wslController.stopAll()
+        app.exit(0)
+      })
     })
   }
 
@@ -203,6 +239,7 @@ const main = Effect.gen(function* () {
 
   registerIpcHandlers({
     killSidecar: () => killSidecar(),
+    relaunch: () => relaunchApp(),
     awaitInitialization: Effect.fnUntraced(
       function* (sendStep) {
         sendStep(initStep)
@@ -219,17 +256,28 @@ const main = Effect.gen(function* () {
       },
       (e) => Effect.runPromise(e),
     ),
+    getWslServersState: () => wslController.getState(),
+    onWslServersEvent: (listener) => wslController.subscribe(listener),
+    wslServersProbeRuntime: () => wslController.probeRuntime(),
+    wslServersRefreshDistros: () => wslController.refreshDistros(),
+    wslServersInstallWsl: () => wslController.installWsl(),
+    wslServersInstallDistro: (name) => wslController.installDistro(name),
+    wslServersProbeDistro: (name) => wslController.probeDistro(name),
+    wslServersProbeOpencode: (name) => wslController.probeOpencode(name),
+    wslServersInstallOpencode: (name) => wslController.installOpencode(name),
+    wslServersOpenTerminal: (name) => wslController.openTerminal(name),
+    wslServersAddServer: (distro) => wslController.addServer(distro),
+    wslServersRemoveServer: (id) => wslController.removeServer(id),
+    wslServersStartServer: (id) => wslController.startServer(id),
     getWindowConfig: () => ({ updaterEnabled: UPDATER_ENABLED }),
     consumeInitialDeepLinks: () => pendingDeepLinks.splice(0),
     getDefaultServerUrl: () => getDefaultServerUrl(),
     setDefaultServerUrl: (url) => setDefaultServerUrl(url),
-    getWslConfig: () => Promise.resolve(getWslConfig()),
-    setWslConfig: (config: WslConfig) => setWslConfig(config),
     getDisplayBackend: async () => null,
     setDisplayBackend: async () => undefined,
     parseMarkdown: async (markdown) => parseMarkdown(markdown),
     checkAppExists: (appName) => checkAppExists(appName),
-    wslPath: async (path, mode) => wslPath(path, mode),
+    wslPath: async (path, mode, distro) => wslPath(path, mode, distro),
     resolveAppPath: async (appName) => resolveAppPath(appName),
     loadingWindowComplete: () => Deferred.doneUnsafe(loadingComplete, Effect.void),
     runUpdater: async (alertOnFail) => checkForUpdates(alertOnFail, killSidecar),
@@ -246,13 +294,7 @@ const main = Effect.gen(function* () {
   setDockIcon()
   setupAutoUpdater()
 
-  const needsMigration = ((): boolean => {
-    if (process.env.OPENCODE_DB === ":memory:") return false
-
-    const xdg = process.env.XDG_DATA_HOME
-    const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "share")
-    return !existsSync(join(base, "opencode", "opencode.db"))
-  })()
+  const needsMigration = process.env.OPENCODE_DB === ":memory:" ? false : !sqliteFileExists()
   let overlay: BrowserWindow | null = null
 
   const port = yield* Effect.gen(function* () {
@@ -263,17 +305,17 @@ const main = Effect.gen(function* () {
     }
 
     const res = yield* Deferred.make<number, unknown>()
-    const server = createServer()
-    server.on("error", (e) => Deferred.failSync(res, () => e))
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address()
+    const localServer = createServer()
+    localServer.on("error", (e) => Deferred.failSync(res, () => e))
+    localServer.listen(0, "127.0.0.1", () => {
+      const address = localServer.address()
       if (typeof address !== "object" || !address) {
-        server.close()
+        localServer.close()
         Deferred.failSync(res, () => new Error("Failed to get port"))
         return
       }
-      const port = address.port
-      server.close(() => Effect.runSync(Deferred.succeed(res, port)))
+      const selectedPort = address.port
+      localServer.close(() => Effect.runSync(Deferred.succeed(res, selectedPort)))
     })
 
     return yield* Deferred.await(res)
@@ -318,6 +360,8 @@ const main = Effect.gen(function* () {
       password,
     })
 
+    void wslController.initialize().catch((error) => logger.error("wsl server initialization failed", error))
+
     yield* Effect.promise(() => health.wait).pipe(
       Effect.timeout("30 seconds"),
       Effect.catch((e) =>
@@ -356,12 +400,7 @@ const main = Effect.gen(function* () {
         void checkForUpdates(true, killSidecar)
       },
       reload: () => mainWindow?.reload(),
-      relaunch: () => {
-        void killSidecar().finally(() => {
-          app.relaunch()
-          app.exit(0)
-        })
-      },
+      relaunch: () => relaunchApp(),
     })
   }
 
